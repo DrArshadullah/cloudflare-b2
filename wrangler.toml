@@ -5,7 +5,7 @@ compatibility_date = "2023-09-04"
 
 main = "index.js"
 
-# Don't put your application key in this file!
+# Don't put your application key in this file! Keep secrets out of GitHub.
 # You should set it as a secret in the Cloudflare dashboard or at the command line:
 # echo "<your b2 application key>" | wrangler secret put B2_APPLICATION_KEY
 [vars]
