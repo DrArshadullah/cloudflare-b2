@@ -133,13 +133,16 @@ function addDownloadHeaders(response, disposition, filename) {
     const newResponse = new Response(response.body, response);
 
     if (disposition === "attachment") {
-        newResponse.headers.set(
-            "Content-Disposition",
-            `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`
-        );
-    } else {
-        newResponse.headers.delete("Content-Disposition");
-    }
+    const fallbackFilename = filename
+        .replace(/\\/g, "\\\\")
+        .replace(/"/g, '\\"')
+        .replace(/[\r\n]/g, "");
+
+    newResponse.headers.set(
+        "Content-Disposition",
+        `attachment; filename="${fallbackFilename}"; filename*=UTF-8''${encodeURIComponent(filename)}`
+    );
+}
 
     // Never allow the public Worker response itself to be cached.
     // The B2 fetch performed below is what Cloudflare caches.
