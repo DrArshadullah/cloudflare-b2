@@ -1,20 +1,16 @@
 //
-// Proxy Backblaze S3 compatible API requests, sending notifications to a webhook
+// Proxy private Backblaze S3-compatible API requests through Cloudflare,
+// with signed CDN URLs and Cloudflare edge caching.
 //
 // Adapted from https://github.com/obezuk/worker-signed-s3-template
 //
+
 import { AwsClient } from 'aws4fetch'
 
 const UNSIGNABLE_HEADERS = [
-    // These headers appear in the request, but are never passed upstream
     'x-forwarded-proto',
     'x-real-ip',
-    // We can't include accept-encoding in the signature because Cloudflare
-    // sets the incoming accept-encoding header to "gzip, br", then modifies
-    // the outgoing request to set accept-encoding to "gzip".
-    // Not cool, Cloudflare!
     'accept-encoding',
-    // Conditional headers are not consistently passed upstream
     'if-match',
     'if-modified-since',
     'if-none-match',
@@ -22,17 +18,12 @@ const UNSIGNABLE_HEADERS = [
     'if-unmodified-since',
 ];
 
-// URL needs colon suffix on protocol, and port as a string
 const HTTPS_PROTOCOL = "https:";
 const HTTPS_PORT = "443";
 
-// How many times to retry a range request where the response is missing content-range
 const RANGE_RETRY_ATTEMPTS = 3;
 
-// Filter out cf-* and any other headers we don't want to include in the signature
 function filterHeaders(headers, env) {
-    // Suppress irrelevant IntelliJ warning
-    // noinspection JSCheckFunctionSignatures
     return new Headers(Array.from(headers.entries())
         .filter(pair => !(
             UNSIGNABLE_HEADERS.includes(pair[0])
@@ -53,39 +44,180 @@ function createHeadResponse(response) {
 function isListBucketRequest(env, path) {
     const pathSegments = path.split('/');
 
-    return (env['BUCKET_NAME'] === "$path" && pathSegments.length < 2) // https://endpoint/bucket-name/
-        || (env['BUCKET_NAME'] !== "$path" && path.length === 0); // https://bucket-name.endpoint/ or https://endpoint/
+    return (env['BUCKET_NAME'] === "$path" && pathSegments.length < 2)
+        || (env['BUCKET_NAME'] !== "$path" && path.length === 0);
 }
 
-// Supress IntelliJ's "unused default export" warning
+function toHex(buffer) {
+    return [...new Uint8Array(buffer)]
+        .map(byte => byte.toString(16).padStart(2, "0"))
+        .join("");
+}
+
+async function createHmac(secret, message) {
+    const key = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(secret),
+        {
+            name: "HMAC",
+            hash: "SHA-256"
+        },
+        false,
+        ["sign"]
+    );
+
+    const signature = await crypto.subtle.sign(
+        "HMAC",
+        key,
+        new TextEncoder().encode(message)
+    );
+
+    return toHex(signature);
+}
+
+async function verifyToken(secret, path, expires, disposition, filename, token) {
+    if (!secret || !expires || !token) {
+        return false;
+    }
+
+    const expiry = Number(expires);
+
+    if (!Number.isSafeInteger(expiry)) {
+        return false;
+    }
+
+    // Reject expired links, allowing 30 seconds of clock skew.
+    if (expiry < Math.floor(Date.now() / 1000) - 30) {
+        return false;
+    }
+
+    // Only allow the two modes we generate from BeDrive.
+    if (disposition !== "inline" && disposition !== "attachment") {
+        return false;
+    }
+
+    if (filename.includes("\r") || filename.includes("\n")) {
+        return false;
+    }
+
+    const message = `${path}\n${expiry}\n${disposition}\n${filename}`;
+
+    const expected = await createHmac(secret, message);
+
+    if (expected.length !== token.length) {
+        return false;
+    }
+
+    const expectedBytes = new TextEncoder().encode(expected);
+    const suppliedBytes = new TextEncoder().encode(token);
+
+    let difference = 0;
+
+    for (let i = 0; i < expectedBytes.length; i++) {
+        difference |= expectedBytes[i] ^ suppliedBytes[i];
+    }
+
+    return difference === 0;
+}
+
+function unauthorized() {
+    return new Response("Unauthorized", {
+        status: 403,
+        headers: {
+            "Cache-Control": "private, no-store"
+        }
+    });
+}
+
+function addDownloadHeaders(response, disposition, filename) {
+    const newResponse = new Response(response.body, response);
+
+    if (disposition === "attachment") {
+        newResponse.headers.set(
+            "Content-Disposition",
+            `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`
+        );
+    } else {
+        newResponse.headers.delete("Content-Disposition");
+    }
+
+    // Never allow the public Worker response itself to be cached.
+    // The B2 fetch performed below is what Cloudflare caches.
+    newResponse.headers.set(
+        "Cache-Control",
+        "private, no-store"
+    );
+
+    return newResponse;
+}
+
+// Suppress IntelliJ's "unused default export" warning
 // noinspection JSUnusedGlobalSymbols
 export default {
     async fetch(request, env) {
-        // Only allow GET and HEAD methods
-        if (!['GET', 'HEAD'].includes(request.method)){
+
+        // Only allow GET and HEAD methods.
+        if (!['GET', 'HEAD'].includes(request.method)) {
             return new Response(null, {
                 status: 405,
-                statusText: "Method Not Allowed"
+                statusText: "Method Not Allowed",
+                headers: {
+                    "Allow": "GET, HEAD",
+                    "Cache-Control": "private, no-store"
+                }
             });
         }
 
+        const incomingUrl = new URL(request.url);
+
+        //
+        // ------------------------------------------------------------
+        // 1. Validate the BeDrive-generated signed CDN URL
+        // ------------------------------------------------------------
+        //
+
+        const expires = incomingUrl.searchParams.get("expires");
+        const token = incomingUrl.searchParams.get("token");
+        const disposition = incomingUrl.searchParams.get("disposition") || "inline";
+        const filename = incomingUrl.searchParams.get("filename") || "";
+
+        // The signature covers the exact public path.
+        const requestedPath = incomingUrl.pathname;
+
+        const validToken = await verifyToken(
+            env["CDN_SHARED_SECRET"],
+            requestedPath,
+            expires,
+            disposition,
+            filename,
+            token
+        );
+
+        if (!validToken) {
+            return unauthorized();
+        }
+
+        //
+        // ------------------------------------------------------------
+        // 2. Build the existing Backblaze URL exactly as before
+        // ------------------------------------------------------------
+        //
+
         const url = new URL(request.url);
 
-        // Incoming protocol and port is taken from the worker's environment.
-        // Local dev mode uses plain http on 8787, and it's possible to deploy
-        // a worker on plain http. B2 only supports https on 443
+        // Incoming protocol and port are taken from the Worker environment.
+        // B2 only supports HTTPS on 443.
         url.protocol = HTTPS_PROTOCOL;
         url.port = HTTPS_PORT;
 
-        // Remove leading slashes from path
+        // Remove leading slashes from path.
         let path = url.pathname.replace(/^\//, '');
 
-        // Remove trailing slashes
+        // Remove trailing slashes.
         path = path.replace(/\/$/, '');
 
-        // Hide the Backblaze endpoint from the public CDN URL.
-        // BeDrive's existing B2 object keys contain the endpoint as
-        // their first path segment, so add it back internally.
+        // BeDrive's existing B2 object keys contain the endpoint as their
+        // first path segment, so add it back internally.
         const b2EndpointPrefix = env['B2_ENDPOINT'] + '/';
 
         if (!path.startsWith(b2EndpointPrefix)) {
@@ -95,128 +227,197 @@ export default {
         // Use the reconstructed object key when requesting B2.
         url.pathname = '/' + path;
 
-        // Reject list bucket requests unless configuration allows it
+        // IMPORTANT:
+        // Remove the CDN authentication parameters before contacting B2.
+        // Therefore the token/expiry are NOT part of the B2 cache URL.
+        url.search = "";
+
+        //
+        // ------------------------------------------------------------
+        // 3. Reject bucket listing
+        // ------------------------------------------------------------
+        //
+
         if (isListBucketRequest(env, path) && String(env['ALLOW_LIST_BUCKET']) !== "true") {
             return new Response(null, {
                 status: 404,
-                statusText: "Not Found"
+                statusText: "Not Found",
+                headers: {
+                    "Cache-Control": "private, no-store"
+                }
             });
         }
 
-        // Set RCLONE_DOWNLOAD to "true" to use rclone with --b2-download-url
-        // See https://rclone.org/b2/#b2-download-url
+        //
+        // ------------------------------------------------------------
+        // 4. Configure B2 origin
+        // ------------------------------------------------------------
+        //
+
         const rcloneDownload = String(env["RCLONE_DOWNLOAD"]) === 'true';
 
-        // Set upstream target hostname.
         switch (env['BUCKET_NAME']) {
             case "$path":
-                // Bucket name is initial segment of URL path
                 url.hostname = env['B2_ENDPOINT'];
                 break;
+
             case "$host":
-                // Bucket name is initial subdomain of the incoming hostname
                 url.hostname = url.hostname.split('.')[0] + '.' + env['B2_ENDPOINT'];
                 break;
+
             default:
-                // Bucket name is specified in the BUCKET_NAME variable
                 url.hostname = env['BUCKET_NAME'] + "." + env['B2_ENDPOINT'];
                 break;
         }
 
-        // Certain headers, such as x-real-ip, appear in the incoming request but
-        // are removed from the outgoing request. If they are in the outgoing
-        // signed headers, B2 can't validate the signature.
         const headers = filterHeaders(request.headers, env);
 
-        // Create an S3 API client that can sign the outgoing request
+        //
+        // ------------------------------------------------------------
+        // 5. Sign the B2 request
+        // ------------------------------------------------------------
+        //
+
         const client = new AwsClient({
             "accessKeyId": env['B2_APPLICATION_KEY_ID'],
             "secretAccessKey": env['B2_APPLICATION_KEY'],
             "service": "s3",
         });
 
-        // Save the request method, so we can process responses for HEAD requests appropriately
         const requestMethod = request.method;
 
         if (rcloneDownload) {
             if (env['BUCKET_NAME'] === "$path") {
-                // Remove leading file/ prefix from the path
                 url.pathname = path.replace(/^file\//, "");
             } else {
-                // Remove leading file/{bucket_name}/ prefix from the path 
                 url.pathname = path.replace(/^file\/[^/]+\//, "");
-            }            
+            }
         }
 
-        // Sign the outgoing request
-        //
-        // For HEAD requests Cloudflare appears to change the method on the outgoing request to GET (#18), which
-        // breaks the signature, resulting in a 403. So, change all HEADs to GETs. This is not too inefficient,
-        // since we won't read the body of the response if the original request was a HEAD.
+        // Preserve the existing behaviour where HEAD is signed as GET.
         const signedRequest = await client.sign(url.toString(), {
             method: 'GET',
             headers: headers
         });
 
-        // For large files, Cloudflare will return the entire file, rather than the requested range
-        // So, if there is a range header in the request, check that the response contains the
-        // content-range header. If not, abort the request and try again.
-        // See https://community.cloudflare.com/t/cloudflare-worker-fetch-ignores-byte-request-range-on-initial-request/395047/4
+        //
+        // ------------------------------------------------------------
+        // 6. Fetch B2 through Cloudflare's cache
+        // ------------------------------------------------------------
+        //
+
+        async function fetchFromB2() {
+            return fetch(signedRequest, {
+                cf: {
+                    cacheEverything: true,
+                    cacheTtlByStatus: {
+                        "200-299": 86400,
+                        "404": 60,
+                        "500-599": 0
+                    }
+                }
+            });
+        }
+
+        //
+        // Range requests
+        //
+        // Keep the existing retry protection. Cloudflare's cache can
+        // subsequently handle cached range delivery.
+        //
+
         if (signedRequest.headers.has("range")) {
+
             let attempts = RANGE_RETRY_ATTEMPTS;
             let response;
+
             do {
-                let controller = new AbortController();
-                response = await fetch(signedRequest.url, {
-                    method: signedRequest.method,
-                    headers: signedRequest.headers,
+                const controller = new AbortController();
+
+                response = await fetch(signedRequest, {
+                    cf: {
+                        cacheEverything: true,
+                        cacheTtlByStatus: {
+                            "200-299": 86400,
+                            "404": 60,
+                            "500-599": 0
+                        }
+                    },
                     signal: controller.signal,
                 });
+
                 if (response.headers.has("content-range")) {
-                    // Only log if it didn't work first time
+
                     if (attempts < RANGE_RETRY_ATTEMPTS) {
-                        console.log(`Retry for ${signedRequest.url} succeeded - response has content-range header`);
+                        console.log(
+                            `Retry for ${signedRequest.url} succeeded - response has content-range header`
+                        );
                     }
-                    // Break out of loop and return the response
+
                     break;
+
                 } else if (response.ok) {
+
                     attempts -= 1;
-                    console.error(`Range header in request for ${signedRequest.url} but no content-range header in response. Will retry ${attempts} more times`);
-                    // Do not abort on the last attempt, as we want to return the response
+
+                    console.error(
+                        `Range header in request for ${signedRequest.url} but no content-range header in response. Will retry ${attempts} more times`
+                    );
+
                     if (attempts > 0) {
                         controller.abort();
                     }
+
                 } else {
-                    // Response is not ok, so don't retry
+
                     break;
                 }
+
             } while (attempts > 0);
 
             if (attempts <= 0) {
-                console.error(`Tried range request for ${signedRequest.url} ${RANGE_RETRY_ATTEMPTS} times, but no content-range in response.`);
+                console.error(
+                    `Tried range request for ${signedRequest.url} ${RANGE_RETRY_ATTEMPTS} times, but no content-range in response.`
+                );
             }
 
             if (requestMethod === 'HEAD') {
-                // Original request was HEAD, so return a new Response without a body
-                return createHeadResponse(response);
+                const headResponse = createHeadResponse(response);
+
+                return addDownloadHeaders(
+                    headResponse,
+                    disposition,
+                    filename
+                );
             }
 
-            // Return whatever response we have rather than an error response
-            // This response cannot be aborted, otherwise it will raise an exception
-            return response;
+            return addDownloadHeaders(
+                response,
+                disposition,
+                filename
+            );
         }
 
-            // Send the signed request to B2.
-        const fetchPromise = fetch(signedRequest);
+        //
+        // Normal GET / HEAD
+        //
+
+        const response = await fetchFromB2();
 
         if (requestMethod === 'HEAD') {
-            const response = await fetchPromise;
+            const headResponse = createHeadResponse(response);
 
-            // Original request was HEAD, so return a new Response without a body
-            return createHeadResponse(response);
+            return addDownloadHeaders(
+                headResponse,
+                disposition,
+                filename
+            );
         }
 
-        // Return the upstream response unchanged
-        return fetchPromise;
+        return addDownloadHeaders(
+            response,
+            disposition,
+            filename
+        );
     },
 };
