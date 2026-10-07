@@ -206,16 +206,44 @@ export default {
             return response;
         }
 
-        // Send the signed request to B2
+        // Send the signed request to B2.
+        // For normal GET requests, use Cloudflare's edge cache.
+        // Range requests continue through the existing range-handling code above.
+        if (requestMethod === 'GET') {
+            const cache = caches.default;
+
+            // Use the public CDN URL as the cache key.
+            const cacheKey = new Request(request.url, {
+                method: 'GET',
+            });
+
+            // Check Cloudflare edge cache first.
+            const cachedResponse = await cache.match(cacheKey);
+
+            if (cachedResponse) {
+                return cachedResponse;
+            }
+
+            // Cache miss: fetch the private object from B2.
+            const response = await fetch(signedRequest);
+
+            // Only cache successful responses.
+            if (response.ok) {
+                await cache.put(cacheKey, response.clone());
+            }
+
+            return response;
+        }
+
+        // HEAD requests are fetched from B2 but don't return a body.
         const fetchPromise = fetch(signedRequest);
 
         if (requestMethod === 'HEAD') {
             const response = await fetchPromise;
-            // Original request was HEAD, so return a new Response without a body
+
             return createHeadResponse(response);
         }
 
-        // Return the upstream response unchanged
         return fetchPromise;
     },
 };
