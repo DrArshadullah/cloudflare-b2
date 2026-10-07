@@ -79,8 +79,21 @@ export default {
 
         // Remove leading slashes from path
         let path = url.pathname.replace(/^\//, '');
+
         // Remove trailing slashes
         path = path.replace(/\/$/, '');
+
+        // Hide the Backblaze endpoint from the public CDN URL.
+        // BeDrive's existing B2 object keys contain the endpoint as
+        // their first path segment, so add it back internally.
+        const b2EndpointPrefix = env['B2_ENDPOINT'] + '/';
+
+        if (!path.startsWith(b2EndpointPrefix)) {
+            path = b2EndpointPrefix + path;
+        }
+
+        // Use the reconstructed object key when requesting B2.
+        url.pathname = '/' + path;
 
         // Reject list bucket requests unless configuration allows it
         if (isListBucketRequest(env, path) && String(env['ALLOW_LIST_BUCKET']) !== "true") {
